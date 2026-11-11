@@ -376,6 +376,9 @@ dev = [
     { name = "ruff" },
     { name = "types-pyyaml" },
 ]
+loadtest = [
+    { name = "locust" },
+]
 
 [package.metadata]
 requires-dist = [
@@ -397,6 +400,7 @@ dev = [
     { name = "ruff", specifier = ">=0.6.0" },
     { name = "types-pyyaml", specifier = ">=6.0.0" },
 ]
+loadtest = [{ name = "locust", specifier = ">=2.31.0" }]
 
 [[package]]
 name = "httpcore"

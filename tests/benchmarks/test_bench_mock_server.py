@@ -332,3 +332,25 @@ async def test_server_as_async_context_manager() -> None:
 
 def test_threaded_server_exit_without_start_is_a_no_op() -> None:
     ThreadedMockServer(FAST).__exit__(None, None, None)
+
+
+def test_cli_serves_until_sigterm(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    import os
+    import signal
+
+    original_start = MockVllmServer.start
+
+    async def start_then_signal(
+        self: MockVllmServer, host: str = "127.0.0.1", port: int = 0
+    ) -> str:
+        url = await original_start(self, host, port)
+        # Runs on the next loop turn, i.e. only after serve() installed its handlers.
+        asyncio.get_running_loop().call_soon(os.kill, os.getpid(), signal.SIGTERM)
+        return url
+
+    monkeypatch.setattr(MockVllmServer, "start", start_then_signal)
+    assert main(["--port", "0"]) == 0  # no --run-seconds: runs until signalled
+    assert "listening on" in capsys.readouterr().out
+    assert signal.getsignal(signal.SIGTERM) == signal.SIG_DFL  # handler removed again

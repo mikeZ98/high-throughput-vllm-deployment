@@ -68,11 +68,13 @@ def test_dev_dependencies() -> None:
         "pytest-cov>=5.0.0",
         "pytest-socket>=0.7.0",
         "hypothesis>=6.100.0",
-        "locust>=2.31.0",
         "types-pyyaml>=6.0.0",
         "pyyaml>=6.0.0",
     }
-    assert set(PYPROJECT["dependency-groups"]["dev"]) == expected
+    dev = PYPROJECT["dependency-groups"]["dev"]
+    assert {d for d in dev if isinstance(d, str)} == expected
+    assert {"include-group": "loadtest"} in dev
+    assert PYPROJECT["dependency-groups"]["loadtest"] == ["locust>=2.31.0"]
 
 
 @pytest.mark.parametrize(

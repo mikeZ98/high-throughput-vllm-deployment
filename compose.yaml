@@ -1,0 +1,135 @@
+# Cluster orchestration. Every service is profile-gated, so nothing starts by
+# accident (e.g. a GPU service on a laptop):
+#
+#   cp .env.example .env
+#   docker compose --profile gpu up -d                       # real vLLM on NVIDIA GPUs
+#   docker compose --profile mock up -d                      # zero-GPU mock (CI / macOS)
+#   docker compose --profile mock --profile loadtest up      # mock + headless Locust
+#   LOADGEN_TARGET_URL=http://vllm-server:8000 \
+#     docker compose --profile gpu --profile loadtest up     # Locust against real vLLM
+#
+# `.env` is used only for interpolation: no service receives it via env_file,
+# so VLLM_* settings never leak into vLLM's own environment (VLLM_PORT there
+# is vLLM's internal IPC port). Published ports bind to loopback only.
+
+name: high-throughput-vllm
+
+x-logging: &logging
+  driver: json-file
+  options:
+    max-size: 10m
+    max-file: "3"
+
+x-app-build: &app-build
+  context: .
+  dockerfile: Dockerfile
+  target: runtime
+
+x-app-hardening: &app-hardening
+  user: "10001:10001"
+  read_only: true
+  tmpfs:
+    - /tmp:size=64m
+  cap_drop:
+    - ALL
+  security_opt:
+    - no-new-privileges:true
+  init: true
+  logging: *logging
+
+services:
+  vllm-server:
+    image: ${SERVER_IMAGE:-vllm/vllm-openai:latest}
+    profiles: ["gpu"]
+    command:
+      - --model
+      - ${VLLM_MODEL:-mistralai/Mistral-7B-Instruct-v0.2}
+      - --host
+      - 0.0.0.0
+      - --port
+      - "8000"
+      - --gpu-memory-utilization
+      - ${VLLM_GPU_MEMORY_UTILIZATION:-0.90}
+      - --max-num-batched-tokens
+      - ${VLLM_MAX_NUM_BATCHED_TOKENS:-8192}
+      - --max-model-len
+      - ${VLLM_MAX_MODEL_LEN:-4096}
+      - --tensor-parallel-size
+      - ${VLLM_TENSOR_PARALLEL_SIZE:-1}
+    ports:
+      - "127.0.0.1:${VLLM_DEPLOYMENT_PORT:-8000}:8000"
+    environment:
+      HF_HOME: /models/huggingface
+      HUGGING_FACE_HUB_TOKEN: ${HF_TOKEN:-}
+    volumes:
+      - hf-cache:/models/huggingface
+    shm_size: ${SERVER_SHM_SIZE:-16g}
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    healthcheck:
+      test:
+        - CMD
+        - python3
+        - -c
+        - "import os, sys, urllib.request; url = os.environ.get('HEALTHCHECK_URL', 'http://127.0.0.1:8000/health'); sys.exit(0 if urllib.request.urlopen(url, timeout=4).status == 200 else 1)"
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      # Raise for large models: weights must load before /health answers.
+      start_period: ${SERVER_HEALTH_START_PERIOD:-30s}
+    security_opt:
+      - no-new-privileges:true
+    restart: unless-stopped
+    logging: *logging
+
+  vllm-mock:
+    <<: *app-hardening
+    build: *app-build
+    image: high-throughput-vllm-deployment:${APP_IMAGE_TAG:-local}
+    profiles: ["mock"]
+    command:
+      - --host
+      - 0.0.0.0
+      - --port
+      - "8000"
+      - --model
+      - ${VLLM_MODEL:-mistralai/Mistral-7B-Instruct-v0.2}
+    ports:
+      - "127.0.0.1:${MOCK_PORT:-8001}:8000"
+    restart: unless-stopped
+
+  locust-loadgen:
+    <<: *app-hardening
+    build: *app-build
+    image: high-throughput-vllm-deployment:${APP_IMAGE_TAG:-local}
+    profiles: ["loadtest"]
+    entrypoint: ["locust", "-f", "/app/locustfile.py"]
+    command:
+      - --headless
+      - --users=${LOCUST_USERS:-50}
+      - --spawn-rate=${LOCUST_SPAWN_RATE:-10}
+      - --run-time=${LOCUST_RUN_TIME:-60s}
+      - --host=${LOADGEN_TARGET_URL:-http://vllm-mock:8000}
+      - --vllm-model=${VLLM_MODEL:-mistralai/Mistral-7B-Instruct-v0.2}
+      - --vllm-benchmark-output=reports/locust-benchmark.json
+      - --csv=reports/locust
+      - --html=reports/locust.html
+      - --only-summary
+    working_dir: /app
+    volumes:
+      - ./reports:/app/reports:rw
+    depends_on:
+      vllm-mock:
+        condition: service_healthy
+        required: false
+      vllm-server:
+        condition: service_healthy
+        required: false
+
+volumes:
+  hf-cache:

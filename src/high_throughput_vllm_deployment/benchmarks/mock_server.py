@@ -26,6 +26,7 @@ import argparse
 import asyncio
 import contextlib
 import json
+import signal
 import sys
 import threading
 from collections.abc import AsyncIterator, Sequence
@@ -418,14 +419,22 @@ async def serve(args: argparse.Namespace) -> None:
     )
     server = MockVllmServer(MockVllmEngine(config), fault_every=args.fault_every)
     await server.start(args.host, args.port)
+    # As a container's PID 1, Python ignores SIGTERM unless a handler is
+    # installed; without this `docker stop` would wait and then SIGKILL.
+    loop = asyncio.get_running_loop()
+    stop = asyncio.Event()
+    signals = (signal.SIGTERM, signal.SIGINT)
+    for sig in signals:
+        loop.add_signal_handler(sig, stop.set)
+    if args.run_seconds > 0:
+        loop.call_later(args.run_seconds, stop.set)
     try:
         sys.stdout.write(f"mock vLLM server listening on {server.base_url}\n")
         sys.stdout.flush()
-        if args.run_seconds > 0:
-            await asyncio.sleep(args.run_seconds)
-        else:  # pragma: no cover - interactive mode, terminated by a signal
-            await asyncio.Event().wait()
+        await stop.wait()
     finally:
+        for sig in signals:
+            loop.remove_signal_handler(sig)
         await server.aclose()
 
 

@@ -1,0 +1,20 @@
+# Fail-closed build context: ignore everything, then allow-list build inputs.
+*
+!pyproject.toml
+!uv.lock
+!README.md
+!src/
+!scripts/
+
+# Defense in depth inside the allow-listed trees.
+**/__pycache__
+**/*.pyc
+**/*.pyo
+**/.DS_Store
+.cache/
+.venv/
+.git/
+tests/
+dist/
+.env*
+!.env.example

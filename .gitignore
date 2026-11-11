@@ -21,6 +21,9 @@ dist/
 .coverage.*
 htmlcov/
 
+# Load-test outputs (bind-mounted into the locust-loadgen container).
+reports/
+
 # Secrets.
 .env
 .env.*
