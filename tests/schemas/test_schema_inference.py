@@ -13,6 +13,7 @@ from pydantic import ValidationError
 from high_throughput_vllm_deployment.schemas.enums import FinishReason
 from high_throughput_vllm_deployment.schemas.inference import (
     SSE_DONE_EVENT,
+    AssistantMessage,
     ChatCompletionRequest,
     ChatCompletionResponse,
     ChatMessage,
@@ -305,3 +306,82 @@ def test_any_delta_round_trips_through_sse(
 def test_chat_message_name_must_not_be_blank() -> None:
     with pytest.raises(ValidationError, match="name"):
         ChatMessage(role="user", content="x", name=" ")
+
+
+# --------------------------------------------------------------------------- #
+# vLLM response extensions                                                    #
+# --------------------------------------------------------------------------- #
+
+
+def test_responses_accept_vllm_extension_fields() -> None:
+    logprobs = {
+        "content": [{"token": "hi", "logprob": -0.1, "bytes": [104, 105], "top_logprobs": []}]
+    }
+    chat = ChatCompletionResponse.model_validate(
+        _chat_payload(
+            system_fingerprint="fp-abc",
+            choices=[
+                {
+                    "index": 0,
+                    "message": {
+                        "role": "assistant",
+                        "content": None,
+                        "reasoning_content": "thinking",
+                        "tool_calls": [{"id": "call-1", "type": "function"}],
+                    },
+                    "logprobs": logprobs,
+                    "finish_reason": "stop",
+                    "stop_reason": 128009,
+                }
+            ],
+        )
+    )
+    choice = chat.choices[0]
+    assert chat.system_fingerprint == "fp-abc"
+    assert choice.logprobs == logprobs
+    assert choice.stop_reason == 128009
+    assert choice.message.content is None
+    assert choice.message.tool_calls == [{"id": "call-1", "type": "function"}]
+
+    completion = CompletionResponse.model_validate(
+        _completion_payload(
+            choices=[
+                {"index": 0, "text": "x", "stop_reason": "</s>", "logprobs": {"tokens": ["x"]}}
+            ]
+        )
+    )
+    assert completion.choices[0].stop_reason == "</s>"
+    assert completion.system_fingerprint is None
+
+
+def test_assistant_message_defaults() -> None:
+    message = AssistantMessage()
+    assert (message.role, message.content, message.tool_calls) == ("assistant", None, [])
+
+
+@pytest.mark.parametrize(
+    "choice",
+    [
+        {"index": 0, "text": "x", "stop_reason": 1.5},
+        {"index": 0, "text": "x", "stop_reason": True},
+        {"index": 0, "text": "x", "token_ids": [1, 2]},
+    ],
+)
+def test_extension_fields_stay_strict(choice: dict[str, Any]) -> None:
+    with pytest.raises(ValidationError):
+        CompletionResponse.model_validate(_completion_payload(choices=[choice]))
+
+
+def test_stream_choice_accepts_reasoning_and_stop_reason() -> None:
+    chunk = _chunk(
+        choices=[
+            {
+                "index": 0,
+                "delta": {"reasoning_content": "hmm"},
+                "finish_reason": "stop",
+                "stop_reason": "\n\n",
+            }
+        ]
+    )
+    assert chunk.choices[0].delta.reasoning_content == "hmm"
+    assert chunk.choices[0].stop_reason == "\n\n"

@@ -6,9 +6,9 @@ import ipaddress
 import os
 import re
 from pathlib import Path
-from typing import Annotated, Final, Self
+from typing import Annotated, Any, Final, Self
 
-from pydantic import AfterValidator, BeforeValidator, Field
+from pydantic import AfterValidator, BeforeValidator, Field, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from high_throughput_vllm_deployment.schemas._base import (
@@ -107,7 +107,23 @@ class VllmDeploymentConfig(BaseSettings):
         default="0.0.0.0",  # noqa: S104 - the API server must accept traffic from outside its container
         description="Interface the OpenAI-compatible API server binds to.",
     )
-    port: StrictSettingInt = Field(default=8000, ge=1, le=65535)
+    port: StrictSettingInt = Field(
+        default=8000,
+        ge=1,
+        le=65535,
+        description=(
+            "API server port. Read from VLLM_DEPLOYMENT_PORT, falling back to the legacy "
+            "VLLM_PORT (which vLLM itself also reads as its internal IPC port)."
+        ),
+    )
+    deployment_port: StrictSettingInt | None = Field(
+        default=None,
+        ge=1,
+        le=65535,
+        exclude=True,
+        repr=False,
+        description="Collision-free spelling of `port`; when set it takes precedence.",
+    )
     gpu_memory_utilization: StrictSettingFloat = Field(
         default=0.90,
         gt=0.0,
@@ -121,6 +137,19 @@ class VllmDeploymentConfig(BaseSettings):
     quantization: LaxQuantizationMethod | None = Field(
         default=None, description="Weight quantization method; None means unquantized."
     )
+
+    @model_validator(mode="before")
+    @classmethod
+    def _prefer_deployment_port(cls, data: Any) -> Any:
+        """Fold VLLM_DEPLOYMENT_PORT into `port`.
+
+        The dedicated variable always wins, whatever source either value came
+        from: a deployment that sets it may legitimately also export VLLM_PORT
+        for vLLM's own inter-process communication.
+        """
+        if isinstance(data, dict) and data.get("deployment_port") is not None:
+            return {**data, "port": data["deployment_port"]}
+        return data
 
     @property
     def world_size(self) -> int:

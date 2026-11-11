@@ -321,3 +321,53 @@ def test_env_file_symlink_escape_is_rejected(isolated_env: Path) -> None:
 
 def test_config_path_error_is_a_value_error() -> None:
     assert issubclass(ConfigPathError, ValueError)
+
+
+# --------------------------------------------------------------------------- #
+# VLLM_DEPLOYMENT_PORT (collision-free spelling of VLLM_PORT)                  #
+# --------------------------------------------------------------------------- #
+
+
+def test_deployment_port_env_var_sets_port(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("VLLM_DEPLOYMENT_PORT", "8100")
+    config = VllmDeploymentConfig(model=MODEL_ID)
+    assert config.port == 8100
+    assert "deployment_port" not in config.model_dump()
+
+
+def test_legacy_vllm_port_still_works(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("VLLM_PORT", "8200")
+    assert VllmDeploymentConfig(model=MODEL_ID).port == 8200
+
+
+def test_deployment_port_wins_over_vllm_ipc_port(monkeypatch: pytest.MonkeyPatch) -> None:
+    # A deployment may export VLLM_PORT for vLLM's own IPC; it must not move the API port.
+    monkeypatch.setenv("VLLM_PORT", "51000")
+    monkeypatch.setenv("VLLM_DEPLOYMENT_PORT", "8000")
+    assert VllmDeploymentConfig(model=MODEL_ID).port == 8000
+
+
+def test_deployment_port_wins_across_sources(
+    isolated_env: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _write_env(isolated_env / ".env", VLLM_MODEL=MODEL_ID, VLLM_DEPLOYMENT_PORT="8300")
+    monkeypatch.setenv("VLLM_PORT", "51000")
+    assert VllmDeploymentConfig.from_env_file(".env").port == 8300
+
+
+def test_dotenv_accepts_legacy_and_new_keys(isolated_env: Path) -> None:
+    _write_env(isolated_env / "legacy.env", VLLM_MODEL=MODEL_ID, VLLM_PORT="8400")
+    _write_env(isolated_env / "new.env", VLLM_MODEL=MODEL_ID, VLLM_DEPLOYMENT_PORT="8500")
+    assert VllmDeploymentConfig.from_env_file("legacy.env").port == 8400
+    assert VllmDeploymentConfig.from_env_file("new.env").port == 8500
+
+
+@pytest.mark.parametrize("value", ["0", "65536", "80_80", "true"])
+def test_deployment_port_is_strictly_validated(monkeypatch: pytest.MonkeyPatch, value: str) -> None:
+    monkeypatch.setenv("VLLM_DEPLOYMENT_PORT", value)
+    with pytest.raises(ValidationError, match="port"):
+        VllmDeploymentConfig(model=MODEL_ID)
+
+
+def test_deployment_port_init_kwarg() -> None:
+    assert VllmDeploymentConfig(model=MODEL_ID, deployment_port=9100).port == 9100
