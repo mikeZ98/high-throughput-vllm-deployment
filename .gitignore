@@ -1,0 +1,30 @@
+# Routed tool caches (uv, ruff, mypy, pytest, hypothesis, coverage, tmp).
+.cache/
+
+# Virtual environments.
+.venv/
+
+# Python bytecode and build artifacts.
+__pycache__/
+*.py[cod]
+build/
+dist/
+*.egg-info/
+
+# Default tool cache locations. These must never appear: every tool is routed
+# to .cache/ and scripts/audit_hygiene.sh --workspace fails if they exist.
+.mypy_cache/
+.ruff_cache/
+.pytest_cache/
+.hypothesis/
+.coverage
+.coverage.*
+htmlcov/
+
+# Secrets.
+.env
+.env.*
+!.env.example
+
+# OS noise.
+.DS_Store
