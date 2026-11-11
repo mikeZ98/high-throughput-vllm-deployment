@@ -68,6 +68,12 @@ def _anchor_storage() -> None:
     settings.load_profile("isolated")
 
 
+# Importing Locust normally gevent-monkey-patches the whole interpreter, which
+# would corrupt asyncio, threading and pytest-socket for the rest of the session.
+# Tests that import the locustfile get Locust *without* patching; the headless
+# end-to-end test removes this variable from its subprocess environment.
+os.environ["LOCUST_SKIP_MONKEY_PATCH"] = "1"
+
 # Must run at import time: Hypothesis resolves its storage directory lazily but
 # the profile has to be active before any `@given` test is collected.
 _anchor_storage()

@@ -39,3 +39,6 @@ class InferenceEnginePort(Protocol):
 
     async def is_healthy(self) -> bool:
         """Return whether the engine is ready to serve; never raises."""
+
+    async def aclose(self) -> None:
+        """Release connections/tasks; in-flight requests are aborted."""

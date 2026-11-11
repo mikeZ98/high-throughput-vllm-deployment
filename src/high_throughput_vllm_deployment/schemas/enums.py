@@ -56,9 +56,22 @@ class QuantizationMethod(StrEnum):
     FP8 = "fp8"
 
 
+@unique
+class ErrorCategory(StrEnum):
+    """Failure taxonomy for benchmark accounting."""
+
+    CLIENT_ERROR = "client_error"  # HTTP 4xx: the request was rejected
+    SERVER_ERROR = "server_error"  # HTTP 5xx other than overload/unavailability
+    UNAVAILABLE = "unavailable"  # connection refused/reset, HTTP 502/503/504
+    TIMEOUT = "timeout"  # connect/read/write/pool timeout
+    PROTOCOL = "protocol"  # malformed body or SSE stream
+    OTHER = "other"
+
+
 # Contract models are strict, under which enums only accept member instances.
 # These aliases re-enable value lookup so JSON-decoded dicts validate.
 LaxModelBackend = Annotated[ModelBackend, Strict(False)]
 LaxSchedulerState = Annotated[SchedulerState, Strict(False)]
 LaxFinishReason = Annotated[FinishReason, Strict(False)]
 LaxQuantizationMethod = Annotated[QuantizationMethod, Strict(False)]
+LaxErrorCategory = Annotated[ErrorCategory, Strict(False)]

@@ -64,10 +64,17 @@ class CompletionRequest(SamplingParams):
     prompt: NonEmptyStr | Annotated[list[NonEmptyStr], Field(min_length=1)]
 
 
+class StreamOptions(ContractModel):
+    include_usage: bool = Field(
+        default=False, description="Append a usage-only chunk before [DONE] when streaming."
+    )
+
+
 class ChatCompletionRequest(SamplingParams):
     """Body of ``POST /v1/chat/completions``."""
 
     messages: Annotated[list[ChatMessage], Field(min_length=1)]
+    stream_options: StreamOptions | None = None
 
 
 # --------------------------------------------------------------------------- #

@@ -41,6 +41,7 @@ import itertools
 import json
 import math
 import re
+import weakref
 from collections.abc import AsyncIterator, Iterable
 from dataclasses import dataclass, field
 from typing import Any, Final, Self
@@ -237,6 +238,7 @@ class MockVllmEngine:
         self._task: asyncio.Task[None] | None = None
         self._closed = False
         self._failure: BaseException | None = None
+        self._sinks: weakref.WeakSet[asyncio.Queue[_Event]] = weakref.WeakSet()
 
     # ------------------------------------------------------------------ #
     # Introspection                                                      #
@@ -246,6 +248,29 @@ class MockVllmEngine:
     def clock_s(self) -> float:
         """Simulated seconds elapsed (sum of step durations)."""
         return self._clock_s
+
+    @property
+    def is_idle(self) -> bool:
+        """No sequence is running, waiting or swapped out."""
+        return not (self._running or self._waiting or self._swapped)
+
+    @property
+    def is_quiescent(self) -> bool:
+        """Idle, and every emitted event has been consumed by its requester.
+
+        A request's final token is emitted (making the engine idle) one
+        scheduling turn before its consumer observes it; time may only be
+        skipped once nothing is in flight anywhere.
+        """
+        return self.is_idle and all(sink.empty() for sink in self._sinks)
+
+    def advance_idle_clock(self, seconds: float) -> None:
+        """Skip simulated idle time (virtual-time load generation); only legal when idle."""
+        if seconds < 0:
+            raise ValueError("cannot move the simulated clock backwards")
+        if not self.is_idle:
+            raise RuntimeError("the simulated clock only advances by itself while busy")
+        self._clock_s += seconds
 
     def blocks_for(self, tokens: int) -> int:
         return math.ceil(tokens / self.config.block_size)
@@ -458,7 +483,9 @@ class MockVllmEngine:
         if self._closed:
             raise EngineUnavailableError("mock engine is closed")
         request_id = f"{prefix}-mock-{next(self._request_ids):08d}"
-        return _Submission(request_id, self.config.created_epoch + int(self._clock_s))
+        submission = _Submission(request_id, self.config.created_epoch + int(self._clock_s))
+        self._sinks.add(submission.sink)
+        return submission
 
     def _submit(
         self,
@@ -582,7 +609,7 @@ class MockVllmEngine:
         )
 
     async def stream_chat(self, request: ChatCompletionRequest) -> AsyncIterator[StreamChunk]:
-        submission, _ = self._submit_chat(request, "chatcmpl")
+        submission, prompt_tokens = self._submit_chat(request, "chatcmpl")
 
         def chunk(choice: StreamChoice) -> StreamChunk:
             return StreamChunk(
@@ -612,6 +639,14 @@ class MockVllmEngine:
                         delta=DeltaMessage(content=event.text),
                         finish_reason=event.finish_reason,
                     )
+                )
+            if request.stream_options is not None and request.stream_options.include_usage:
+                yield StreamChunk(
+                    id=submission.request_id,
+                    created=submission.created,
+                    model=self.config.model_name,
+                    choices=[],
+                    usage=self._usage(prompt_tokens, submission),
                 )
         finally:
             self._abort(submission.sequences)

@@ -522,3 +522,21 @@ async def test_is_healthy_never_raises_and_never_retries(
     async with _client(recorder) as client:
         assert await client.is_healthy() is healthy
     assert [r.url.path for r in recorder.requests] == ["/health"]
+
+
+@pytest.mark.asyncio
+async def test_stream_options_are_sent_only_when_streaming() -> None:
+    from high_throughput_vllm_deployment.schemas.inference import StreamOptions
+
+    request = CHAT.model_copy(update={"stream_options": StreamOptions(include_usage=True)})
+    recorder = _Recorder(httpx.Response(200, json=VLLM_CHAT), _sse(SSE_BODY))
+    async with _client(recorder) as client:
+        await client.chat_complete(request)
+        await _collect_request(client, request)
+    blocking, streaming = (json.loads(r.content) for r in recorder.requests)
+    assert "stream_options" not in blocking and blocking["stream"] is False
+    assert streaming["stream_options"] == {"include_usage": True} and streaming["stream"] is True
+
+
+async def _collect_request(client: VllmClient, request: ChatCompletionRequest) -> list[StreamChunk]:
+    return [chunk async for chunk in client.stream_chat(request)]

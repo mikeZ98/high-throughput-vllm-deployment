@@ -74,6 +74,13 @@ warn_unreachable = true
 enable_error_code = ["ignore-without-code", "redundant-expr", "truthy-bool"]
 plugins = ["pydantic.mypy"]
 
+# Locust's event hooks and clients are untyped; confine the relaxation to the
+# one module that touches them.
+[[tool.mypy.overrides]]
+module = ["high_throughput_vllm_deployment.benchmarks.locustfile", "test_bench_locust"]
+disallow_untyped_calls = false
+disallow_untyped_decorators = false
+
 [tool.pydantic-mypy]
 init_forbid_extra = true
 init_typed = true

@@ -134,6 +134,27 @@ def drop_nulls(value: Any) -> Any:
     return value
 
 
+def decode_sse_event(data: str) -> StreamChunk:
+    """Decode one SSE ``data`` payload (not ``[DONE]``) into a :class:`StreamChunk`.
+
+    A ``{"error": ...}`` payload (vLLM's mid-stream failure event) raises
+    :class:`EngineHTTPError`; anything else that is not a valid chunk raises
+    :class:`EngineProtocolError`.
+    """
+    try:
+        payload = json.loads(data)
+    except json.JSONDecodeError as exc:
+        raise EngineProtocolError(f"SSE event is not JSON: {data[:80]!r}") from exc
+    if isinstance(payload, dict) and "error" in payload:
+        raise EngineHTTPError(
+            f"engine reported a mid-stream error: {payload['error']}", status_code=500
+        )
+    try:
+        return StreamChunk.model_validate(drop_nulls(payload))
+    except ValidationError as exc:
+        raise EngineProtocolError(f"invalid StreamChunk payload: {exc}") from exc
+
+
 def _base_url(config: VllmDeploymentConfig) -> str:
     host = _WILDCARD_TO_LOOPBACK.get(config.host, config.host)
     if ":" in host:
@@ -144,6 +165,8 @@ def _base_url(config: VllmDeploymentConfig) -> str:
 def _request_body(request: SamplingParams, *, stream: bool) -> dict[str, Any]:
     body = request.model_dump(mode="json", exclude_none=True)
     body["stream"] = stream
+    if not stream:
+        body.pop("stream_options", None)  # vLLM rejects stream_options without stream
     return body
 
 
@@ -289,33 +312,18 @@ class VllmClient:
                     continue
                 if data == SSE_DONE_SENTINEL:
                     return
-                yield self._decode_chunk(data)
+                yield decode_sse_event(data)
             tail = decoder.flush()
             if tail == SSE_DONE_SENTINEL:
                 return
             if tail is not None:
-                yield self._decode_chunk(tail)
+                yield decode_sse_event(tail)
             raise EngineProtocolError("stream ended before [DONE]")
         except httpx.HTTPError as exc:
             # Mid-stream faults are never retried: tokens were already delivered.
             raise self._map_transport_error(exc, 1) from exc
         finally:
             await response.aclose()
-
-    @staticmethod
-    def _decode_chunk(data: str) -> StreamChunk:
-        try:
-            payload = json.loads(data)
-        except json.JSONDecodeError as exc:
-            raise EngineProtocolError(f"SSE event is not JSON: {data[:80]!r}") from exc
-        if isinstance(payload, dict) and "error" in payload:
-            raise EngineHTTPError(
-                f"engine reported a mid-stream error: {payload['error']}", status_code=500
-            )
-        try:
-            return StreamChunk.model_validate(drop_nulls(payload))
-        except ValidationError as exc:
-            raise EngineProtocolError(f"invalid StreamChunk payload: {exc}") from exc
 
     async def get_telemetry(self) -> ClusterTelemetry:
         response = await self._send("GET", METRICS_PATH)

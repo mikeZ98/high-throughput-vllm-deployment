@@ -563,3 +563,41 @@ async def test_telemetry_reports_live_scheduler_state() -> None:
         busy = await engine.get_telemetry()
         await task
     assert busy.active_requests + busy.waiting_requests == 1
+
+
+# --------------------------------------------------------------------------- #
+# Usage chunk and quiescence                                                  #
+# --------------------------------------------------------------------------- #
+
+
+@pytest.mark.asyncio
+async def test_include_usage_appends_a_usage_only_chunk() -> None:
+    from high_throughput_vllm_deployment.schemas.inference import StreamOptions
+
+    request = _chat("count my tokens", max_tokens=5).model_copy(
+        update={"stream_options": StreamOptions(include_usage=True)}
+    )
+    async with MockVllmEngine(TIGHT, sleep=instant_sleep) as engine:
+        chunks = [chunk async for chunk in engine.stream_chat(request)]
+        plain = [chunk async for chunk in engine.stream_chat(_chat("count my tokens", 5))]
+    assert chunks[-1].choices == [] and chunks[-1].usage is not None
+    assert chunks[-1].usage.completion_tokens == 5
+    assert chunks[-1].usage.prompt_tokens == chat_prompt_tokens(request)
+    assert all(chunk.usage is None for chunk in plain)
+
+
+@pytest.mark.asyncio
+async def test_quiescence_waits_for_results_to_be_consumed() -> None:
+    def state(engine: MockVllmEngine) -> tuple[bool, bool]:
+        # Read through a call: the properties change across awaits.
+        return engine.is_idle, engine.is_quiescent
+
+    async with MockVllmEngine(TIGHT, sleep=instant_sleep) as engine:
+        assert state(engine) == (True, True)
+        stream = engine.stream_chat(_chat("hold the last token", max_tokens=2))
+        await anext(stream)  # role chunk; both tokens are produced while we do not read
+        while not state(engine)[0]:
+            await asyncio.sleep(0)
+        assert state(engine) == (True, False)  # idle, but events still undelivered
+        _ = [chunk async for chunk in stream]
+        assert state(engine) == (True, True)

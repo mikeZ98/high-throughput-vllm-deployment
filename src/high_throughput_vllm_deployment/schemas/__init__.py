@@ -3,6 +3,7 @@
 from high_throughput_vllm_deployment.schemas._base import ContractModel
 from high_throughput_vllm_deployment.schemas.config import ConfigPathError, VllmDeploymentConfig
 from high_throughput_vllm_deployment.schemas.enums import (
+    ErrorCategory,
     FinishReason,
     ModelBackend,
     QuantizationMethod,
@@ -21,6 +22,7 @@ from high_throughput_vllm_deployment.schemas.inference import (
     SamplingParams,
     StreamChoice,
     StreamChunk,
+    StreamOptions,
     Usage,
 )
 from high_throughput_vllm_deployment.schemas.telemetry import (
@@ -44,6 +46,7 @@ __all__ = [
     "ConfigPathError",
     "ContractModel",
     "DeltaMessage",
+    "ErrorCategory",
     "FinishReason",
     "KvCacheBlocks",
     "LatencyPercentiles",
@@ -53,6 +56,7 @@ __all__ = [
     "SchedulerState",
     "StreamChoice",
     "StreamChunk",
+    "StreamOptions",
     "Usage",
     "VllmDeploymentConfig",
 ]
