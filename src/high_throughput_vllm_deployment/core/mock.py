@@ -455,6 +455,16 @@ class MockVllmEngine:
                 self._release(seq)
                 self.stats.aborted_sequences += 1
 
+    def _close(self, submission: _Submission) -> None:
+        """The consumer is gone: abort what is left and forget its undelivered events.
+
+        A consumer cancelled after its final event was queued, but before it
+        read it, would otherwise leave that event pending forever, and the
+        engine would never become quiescent.
+        """
+        self._abort(submission.sequences)
+        self._sinks.discard(submission.sink)
+
     # ------------------------------------------------------------------ #
     # Request admission                                                  #
     # ------------------------------------------------------------------ #
@@ -548,7 +558,7 @@ class MockVllmEngine:
                 if event.finish_reason is not None:
                     reasons[event.choice_index] = event.finish_reason
         finally:
-            self._abort(submission.sequences)
+            self._close(submission)
         return {index: ("".join(pieces[index]), reasons[index]) for index in sorted(reasons)}
 
     @staticmethod
@@ -649,7 +659,7 @@ class MockVllmEngine:
                     usage=self._usage(prompt_tokens, submission),
                 )
         finally:
-            self._abort(submission.sequences)
+            self._close(submission)
 
     async def get_telemetry(self) -> ClusterTelemetry:
         return self.snapshot()

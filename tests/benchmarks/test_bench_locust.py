@@ -19,6 +19,7 @@ from typing import Any
 
 import gevent.monkey  # type: ignore[import-untyped]
 import pytest
+from gevent._hub_local import get_hub_if_exists  # type: ignore[import-untyped]
 from locust.env import Environment
 from locust.event import Events
 
@@ -46,6 +47,11 @@ def _options(**overrides: Any) -> argparse.Namespace:
 def fresh_state(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
     monkeypatch.setattr(locustfile, "_state", None)
     yield
+    # FastHttpUser lazily creates this thread's gevent hub (an event loop that
+    # owns a pipe pair); destroy it so the resource ledger sees no leak.
+    hub = get_hub_if_exists()
+    if hub is not None:
+        hub.destroy(destroy_loop=True)
 
 
 @pytest.fixture

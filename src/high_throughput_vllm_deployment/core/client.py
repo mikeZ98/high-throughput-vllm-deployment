@@ -22,7 +22,11 @@ from high_throughput_vllm_deployment.core.errors import (
     EngineUnavailableError,
 )
 from high_throughput_vllm_deployment.core.metrics import telemetry_from_prometheus
-from high_throughput_vllm_deployment.core.sse import DEFAULT_MAX_EVENT_BYTES, SseDecoder
+from high_throughput_vllm_deployment.core.sse import (
+    DEFAULT_MAX_EVENT_BYTES,
+    LineDecoder,
+    SseDecoder,
+)
 from high_throughput_vllm_deployment.schemas.config import VllmDeploymentConfig
 from high_throughput_vllm_deployment.schemas.inference import (
     SSE_DONE_SENTINEL,
@@ -143,7 +147,7 @@ def decode_sse_event(data: str) -> StreamChunk:
     """
     try:
         payload = json.loads(data)
-    except json.JSONDecodeError as exc:
+    except (json.JSONDecodeError, RecursionError) as exc:
         raise EngineProtocolError(f"SSE event is not JSON: {data[:80]!r}") from exc
     if isinstance(payload, dict) and "error" in payload:
         raise EngineHTTPError(
@@ -151,7 +155,7 @@ def decode_sse_event(data: str) -> StreamChunk:
         )
     try:
         return StreamChunk.model_validate(drop_nulls(payload))
-    except ValidationError as exc:
+    except (ValidationError, RecursionError) as exc:  # RecursionError: absurdly deep JSON
         raise EngineProtocolError(f"invalid StreamChunk payload: {exc}") from exc
 
 
@@ -281,7 +285,7 @@ class VllmClient:
     def _parse(model: type[_ModelT], response: httpx.Response) -> _ModelT:
         try:
             return model.model_validate(drop_nulls(response.json()))
-        except (json.JSONDecodeError, UnicodeDecodeError, ValidationError) as exc:
+        except (json.JSONDecodeError, UnicodeDecodeError, ValidationError, RecursionError) as exc:
             raise EngineProtocolError(f"invalid {model.__name__} payload: {exc}") from exc
 
     # ------------------------------------------------------------------ #
@@ -304,15 +308,18 @@ class VllmClient:
         response = await self._send(
             "POST", CHAT_COMPLETIONS_PATH, body=_request_body(request, stream=True), stream=True
         )
+        lines = LineDecoder(max_line_chars=self._max_sse_event_bytes)
         decoder = SseDecoder(max_event_bytes=self._max_sse_event_bytes)
         try:
-            async for line in response.aiter_lines():
-                data = decoder.feed(line)
-                if data is None:
-                    continue
-                if data == SSE_DONE_SENTINEL:
-                    return
-                yield decode_sse_event(data)
+            async for raw in response.aiter_bytes():
+                for line in lines.feed(raw):
+                    data = decoder.feed(line)
+                    if data is None:
+                        continue
+                    if data == SSE_DONE_SENTINEL:
+                        return
+                    yield decode_sse_event(data)
+            decoder.feed(lines.flush())
             tail = decoder.flush()
             if tail == SSE_DONE_SENTINEL:
                 return

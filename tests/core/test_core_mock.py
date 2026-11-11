@@ -9,6 +9,7 @@ import pytest
 from hypothesis import given, settings
 from hypothesis import strategies as st
 
+from engine_invariants import assert_scheduler_invariants
 from high_throughput_vllm_deployment.core import instant_sleep
 from high_throughput_vllm_deployment.core.errors import (
     EngineRequestError,
@@ -58,32 +59,6 @@ def _chat(content: str, max_tokens: int | None = None, n: int = 1) -> ChatComple
         max_tokens=max_tokens,
         n=n,
     )
-
-
-def assert_scheduler_invariants(engine: MockVllmEngine) -> None:
-    """Internal block accounting must balance exactly at every step."""
-    cfg = engine.config
-    running, waiting, swapped = engine._running, engine._waiting, engine._swapped
-    for queue, state in (
-        (running, SchedulerState.RUNNING),
-        (waiting, SchedulerState.WAITING),
-        (swapped, SchedulerState.SWAPPED),
-    ):
-        assert all(seq.state is state and not seq.finished for seq in queue)
-        assert [seq.seq_id for seq in queue] == sorted(seq.seq_id for seq in queue)
-    ids = [seq.seq_id for seq in (*running, *waiting, *swapped)]
-    assert len(ids) == len(set(ids)), "a sequence is in two queues"
-    assert len(running) <= cfg.max_num_seqs
-    assert sum(seq.gpu_blocks for seq in running) == cfg.num_gpu_blocks - engine._free_gpu
-    assert sum(seq.cpu_blocks for seq in swapped) == cfg.num_cpu_blocks - engine._free_cpu
-    assert all(seq.gpu_blocks == engine.blocks_for(seq.context_len + 1) for seq in running)
-    assert all(seq.gpu_blocks == seq.cpu_blocks == 0 for seq in waiting)
-    assert all(seq.gpu_blocks == 0 and seq.cpu_blocks > 0 for seq in swapped)
-    # FCFS: preemption always takes the latest arrival and admission/swap-in go
-    # oldest-first, so every running sequence arrived before every queued one.
-    queued = [seq.seq_id for seq in (*waiting, *swapped)]
-    if running and queued:
-        assert max(seq.seq_id for seq in running) < min(queued), "FCFS order violated"
 
 
 class StepProbe:
@@ -601,3 +576,27 @@ async def test_quiescence_waits_for_results_to_be_consumed() -> None:
         assert state(engine) == (True, False)  # idle, but events still undelivered
         _ = [chunk async for chunk in stream]
         assert state(engine) == (True, True)
+
+
+@pytest.mark.asyncio
+async def test_abandoned_consumer_does_not_block_quiescence(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A consumer cancelled after its final event was queued (before reading it)
+    must not leave the engine non-quiescent forever (found by FSM fuzzing)."""
+    async with MockVllmEngine(TIGHT, sleep=instant_sleep) as engine:
+        task = asyncio.ensure_future(engine.complete(_completion("last words", max_tokens=1)))
+        await asyncio.sleep(0)
+        sinks = list(engine._sinks)  # keep the queue alive, as a retained traceback would
+        emit = engine._emit
+
+        def emit_then_cancel() -> None:
+            emit()  # queues the final event...
+            task.cancel()  # ...and the consumer is cancelled before it can read it
+
+        monkeypatch.setattr(engine, "_emit", emit_then_cancel)
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        assert engine.is_idle
+        assert not sinks[0].empty()  # the final event really is undelivered
+        assert engine.is_quiescent

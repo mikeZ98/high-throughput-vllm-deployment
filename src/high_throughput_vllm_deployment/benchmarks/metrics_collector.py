@@ -95,7 +95,7 @@ def categorize_exception(exc: BaseException) -> ErrorCategory:
         cls.__name__ in {"ConnectionError", "HTTPConnectionClosed"} for cls in type(exc).__mro__
     ):
         return ErrorCategory.UNAVAILABLE
-    if isinstance(exc, EngineProtocolError | ValueError):
+    if isinstance(exc, EngineProtocolError | ValueError | RecursionError):
         return ErrorCategory.PROTOCOL
     return ErrorCategory.OTHER
 

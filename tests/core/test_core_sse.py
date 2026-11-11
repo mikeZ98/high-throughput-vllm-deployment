@@ -66,3 +66,10 @@ def test_invalid_limit_is_rejected() -> None:
 def test_any_payload_sequence_round_trips(payloads: list[str]) -> None:
     lines = [line for payload in payloads for line in (f"data: {payload}", "")]
     assert _decode(lines) == list(payloads)
+
+
+def test_line_decoder_limit_must_be_positive() -> None:
+    from high_throughput_vllm_deployment.core.sse import LineDecoder
+
+    with pytest.raises(ValueError, match=">= 1"):
+        LineDecoder(max_line_chars=0)

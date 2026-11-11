@@ -354,3 +354,26 @@ def test_cli_serves_until_sigterm(
     assert main(["--port", "0"]) == 0  # no --run-seconds: runs until signalled
     assert "listening on" in capsys.readouterr().out
     assert signal.getsignal(signal.SIGTERM) == signal.SIG_DFL  # handler removed again
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("half_close", [True, False])
+async def test_lingering_close_discards_bounded_input(half_close: bool) -> None:
+    from high_throughput_vllm_deployment.benchmarks import mock_server
+
+    class Writer:
+        eof_written = False
+
+        def can_write_eof(self) -> bool:
+            return half_close  # e.g. TLS transports cannot half-close
+
+        def write_eof(self) -> None:
+            self.eof_written = True
+
+    reader = asyncio.StreamReader()
+    reader.feed_data(b"x" * 200_000)
+    reader.feed_eof()
+    writer = Writer()
+    await mock_server._linger(reader, writer)  # type: ignore[arg-type]
+    assert writer.eof_written is half_close
+    assert reader.at_eof()  # the unread request body was drained

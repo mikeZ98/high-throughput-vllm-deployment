@@ -1,0 +1,617 @@
+# Mutation fault-injection catalogue for scripts/run_mutations.sh.
+#
+# Every mutant replaces one exact, unique `old` snippet of `file` with `new`,
+# runs only `tests`, and counts as KILLED only if pytest reports an assertion
+# failure whose "FAILED <node> - <message>" line matches the `expect` regex.
+# Timeouts, crashes and failures for other reasons are survivors (fail-closed).
+#
+# Each mutant encodes a plausible regression; together they prove that the
+# suite guards every documented invariant. Python mutants must change the AST.
+
+# =========================================================================== #
+# schemas: contract relaxation                                                #
+# =========================================================================== #
+
+[[mutant]]
+id = "schemas-base-accepts-nan"
+suite = "schemas"
+description = "Shared base stops rejecting NaN/Infinity floats"
+file = "src/high_throughput_vllm_deployment/schemas/_base.py"
+old = 'allow_inf_nan=False,'
+new = 'allow_inf_nan=True,'
+tests = ["tests/schemas/test_schema_base.py"]
+expect = "test_non_finite_floats_are_rejected"
+
+[[mutant]]
+id = "schemas-base-allows-extra-fields"
+suite = "schemas"
+description = "Shared base silently accepts unknown fields"
+file = "src/high_throughput_vllm_deployment/schemas/_base.py"
+old = 'extra="forbid",'
+new = 'extra="allow",'
+tests = ["tests/schemas/test_schema_base.py"]
+expect = "test_unknown_fields_are_rejected|test_every_exported_contract"
+
+[[mutant]]
+id = "schemas-base-coerces-scalars"
+suite = "schemas"
+description = "Shared base switches to lax mode ('1' becomes an int)"
+file = "src/high_throughput_vllm_deployment/schemas/_base.py"
+old = 'strict=True,'
+new = 'strict=False,'
+tests = ["tests/schemas/test_schema_base.py"]
+expect = "test_scalars_are_never_coerced|test_every_exported_contract"
+
+[[mutant]]
+id = "schemas-negative-token-counts"
+suite = "schemas"
+description = "Non-negative counters accept -1 (tokens, queues, indices)"
+file = "src/high_throughput_vllm_deployment/schemas/_base.py"
+old = 'NonNegativeInt = Annotated[int, Field(ge=0)]'
+new = 'NonNegativeInt = Annotated[int, Field(ge=-1)]'
+tests = ["tests/schemas/test_schema_telemetry.py", "tests/schemas/test_schema_inference.py"]
+expect = "rejects_invalid_snapshots|rejects_contract_violations"
+
+[[mutant]]
+id = "schemas-percentile-order-inverted"
+suite = "schemas"
+description = "Latency summary checks p99 <= p90 instead of p90 <= p99"
+file = "src/high_throughput_vllm_deployment/schemas/telemetry.py"
+old = 'if not self.p50_ms <= self.p90_ms <= self.p99_ms <= self.max_ms:'
+new = 'if not self.p50_ms <= self.p99_ms <= self.p90_ms <= self.max_ms:'
+tests = ["tests/schemas/test_schema_telemetry.py"]
+expect = "percentiles_accept_exactly_the_monotonic|rejects_inconsistent_runs"
+
+[[mutant]]
+id = "schemas-usage-total-relaxed"
+suite = "schemas"
+description = "Usage accepts total_tokens larger than prompt + completion"
+file = "src/high_throughput_vllm_deployment/schemas/inference.py"
+old = 'if self.total_tokens != expected:'
+new = 'if self.total_tokens < expected:'
+tests = ["tests/schemas/test_schema_inference.py"]
+expect = "test_usage_total_must_equal_sum|rejects_contract_violations"
+
+[[mutant]]
+id = "schemas-temperature-unbounded"
+suite = "schemas"
+description = "Sampling temperature upper bound relaxed from 2.0 to 20.0"
+file = "src/high_throughput_vllm_deployment/schemas/inference.py"
+old = 'temperature: Annotated[FiniteFloat, Field(ge=0.0, le=2.0)] = 1.0'
+new = 'temperature: Annotated[FiniteFloat, Field(ge=0.0, le=20.0)] = 1.0'
+tests = ["tests/schemas/test_schema_inference.py"]
+expect = "test_sampling_parameters_are_validated"
+
+[[mutant]]
+id = "schemas-windows-traversal-allowed"
+suite = "schemas"
+description = "Host-path guard forgets backslash (Windows) traversal"
+file = "src/high_throughput_vllm_deployment/schemas/_base.py"
+old = 'if ".." in posix.parts or ".." in windows.parts:'
+new = 'if ".." in posix.parts:'
+tests = ["tests/schemas/test_schema_base.py"]
+expect = "test_host_path_escapes_are_rejected"
+
+[[mutant]]
+id = "schemas-legacy-port-wins"
+suite = "schemas"
+description = "VLLM_PORT (vLLM's IPC port) overrides VLLM_DEPLOYMENT_PORT"
+file = "src/high_throughput_vllm_deployment/schemas/config.py"
+old = 'if isinstance(data, dict) and data.get("deployment_port") is not None:'
+new = 'if isinstance(data, dict) and data.get("port") is None and data.get("deployment_port") is not None:'
+tests = ["tests/schemas/test_schema_config.py"]
+expect = "deployment_port_wins"
+
+[[mutant]]
+id = "schemas-error-breakdown-relaxed"
+suite = "schemas"
+description = "Benchmark error categories may under-count failed requests"
+file = "src/high_throughput_vllm_deployment/schemas/telemetry.py"
+old = 'if sum(self.errors.values()) != self.failed_requests:'
+new = 'if sum(self.errors.values()) > self.failed_requests:'
+tests = ["tests/schemas/test_schema_telemetry.py"]
+expect = "test_benchmark_result_rejects_inconsistent_runs"
+
+[[mutant]]
+id = "schemas-env-int-underscores"
+suite = "schemas"
+description = "Env parsing accepts non-canonical integers such as 8_000"
+file = "src/high_throughput_vllm_deployment/schemas/config.py"
+old = '_INT_LITERAL: Final = re.compile(r"[+-]?[0-9]+")'
+new = '_INT_LITERAL: Final = re.compile(r"[+-]?[0-9_]+")'
+tests = ["tests/schemas/test_schema_config.py"]
+expect = "test_non_canonical_numbers_are_rejected"
+
+# =========================================================================== #
+# core: scheduler, KV cache, parsers, client                                  #
+# =========================================================================== #
+
+[[mutant]]
+id = "core-batching-skips-steps"
+suite = "core"
+description = "Continuous batching emits tokens only on every other step"
+file = "src/high_throughput_vllm_deployment/core/mock.py"
+old = 'self._emit()'
+new = 'self._emit() if self.stats.steps % 2 else None'
+tests = ["tests/core/test_core_mock.py::test_blocks_grow_with_context_and_are_reclaimed_on_completion"]
+expect = "test_blocks_grow_with_context"
+
+[[mutant]]
+id = "core-preemption-mode-inverted"
+suite = "core"
+description = "Preemption swaps when CPU is full and recomputes when it has room"
+file = "src/high_throughput_vllm_deployment/core/mock.py"
+old = 'if victim.gpu_blocks <= self._free_cpu:'
+new = 'if victim.gpu_blocks > self._free_cpu:'
+tests = [
+    "tests/core/test_core_mock.py::test_gpu_exhaustion_swaps_latest_arrivals_to_cpu_and_back",
+    "tests/core/test_core_mock.py::test_without_swap_space_preempted_requests_are_recomputed_from_waiting",
+]
+expect = "swaps_latest_arrivals|recomputed_from_waiting"
+
+[[mutant]]
+id = "core-kv-block-leak"
+suite = "core"
+description = "Finished sequences never return their GPU blocks"
+file = "src/high_throughput_vllm_deployment/core/mock.py"
+old = '''
+        self._free_gpu += seq.gpu_blocks
+        self._free_cpu += seq.cpu_blocks
+'''
+new = '''
+        self._free_cpu += seq.cpu_blocks
+'''
+tests = ["tests/core/test_core_mock.py::test_blocks_grow_with_context_and_are_reclaimed_on_completion"]
+expect = "reclaimed_on_completion"
+
+[[mutant]]
+id = "core-fcfs-victim-inverted"
+suite = "core"
+description = "Preemption evicts the oldest running sequence instead of the newest"
+file = "src/high_throughput_vllm_deployment/core/mock.py"
+old = 'victim = self._running[-1]'
+new = 'victim = self._running[0]'
+tests = ["tests/core/test_core_mock.py::test_concurrent_outputs_are_invariant_under_preemption"]
+expect = "invariant_under_preemption"
+
+[[mutant]]
+id = "core-fcfs-resume-inverted"
+suite = "core"
+description = "Admission/swap-in picks the newest pending sequence first"
+file = "src/high_throughput_vllm_deployment/core/mock.py"
+old = 'seq = min(self._swapped[:1] + self._waiting[:1], key=_arrival)'
+new = 'seq = max(self._swapped[:1] + self._waiting[:1], key=_arrival)'
+tests = [
+    "tests/core/test_core_mock.py::test_scheduling_never_changes_outputs_and_always_drains",
+    "tests/core/test_core_mock.py::test_swapped_requests_take_priority_over_new_arrivals",
+]
+expect = "never_changes_outputs|take_priority"
+
+[[mutant]]
+id = "core-max-num-seqs-overrun"
+suite = "core"
+description = "Scheduler admits one sequence beyond max_num_seqs"
+file = "src/high_throughput_vllm_deployment/core/mock.py"
+old = 'while (self._swapped or self._waiting) and len(self._running) < cfg.max_num_seqs:'
+new = 'while (self._swapped or self._waiting) and len(self._running) <= cfg.max_num_seqs:'
+tests = ["tests/core/test_core_mock.py::test_max_num_seqs_holds_excess_requests_in_waiting"]
+expect = "max_num_seqs_holds"
+
+[[mutant]]
+id = "core-swap-in-cpu-leak"
+suite = "core"
+description = "Swap-in never returns the CPU blocks of resumed sequences"
+file = "src/high_throughput_vllm_deployment/core/mock.py"
+old = '''
+                    self._free_cpu += seq.cpu_blocks
+                    seq.cpu_blocks = 0
+'''
+new = '''
+                    seq.cpu_blocks = 0
+'''
+tests = ["tests/core/test_core_mock.py::test_gpu_exhaustion_swaps_latest_arrivals_to_cpu_and_back"]
+expect = "swaps_latest_arrivals"
+
+[[mutant]]
+id = "core-quiescence-ignores-backlog"
+suite = "core"
+description = "Engine reports quiescence while results are still undelivered"
+file = "src/high_throughput_vllm_deployment/core/mock.py"
+old = 'return self.is_idle and all(sink.empty() for sink in self._sinks)'
+new = 'return self.is_idle'
+tests = ["tests/core/test_core_mock.py::test_quiescence_waits_for_results_to_be_consumed"]
+expect = "quiescence_waits"
+
+[[mutant]]
+id = "core-abandoned-sink-retained"
+suite = "core"
+description = "Cancelled consumers keep their undelivered events (engine never quiesces)"
+file = "src/high_throughput_vllm_deployment/core/mock.py"
+old = 'self._sinks.discard(submission.sink)'
+new = 'del submission'
+tests = ["tests/core/test_core_mock.py::test_abandoned_consumer_does_not_block_quiescence"]
+expect = "abandoned_consumer"
+
+[[mutant]]
+id = "core-prometheus-name-relaxed"
+suite = "core"
+description = "Prometheus parser accepts metric names starting with a digit"
+file = "src/high_throughput_vllm_deployment/core/metrics.py"
+old = 'r"(?P<name>[a-zA-Z_:][a-zA-Z0-9_:]*)"'
+new = 'r"(?P<name>[a-zA-Z0-9_:]+)"'
+tests = ["tests/core/test_core_metrics.py"]
+expect = "test_parser_rejects_malformed_lines"
+
+[[mutant]]
+id = "core-prometheus-fractional-counts"
+suite = "core"
+description = "Request-count gauges accept fractional values"
+file = "src/high_throughput_vllm_deployment/core/metrics.py"
+old = 'if total != int(total) or total < 0:'
+new = 'if total < 0:'
+tests = ["tests/core/test_core_metrics.py"]
+expect = "test_incomplete_or_inconsistent_metrics_fail_closed"
+
+[[mutant]]
+id = "core-sse-framing-bypass"
+suite = "core"
+description = "SSE decoder ignores blank-line event boundaries"
+file = "src/high_throughput_vllm_deployment/core/sse.py"
+old = 'return self.flush()'
+new = 'return None'
+tests = ["tests/core/test_core_sse.py"]
+expect = "test_events_dispatch_on_blank_lines"
+
+[[mutant]]
+id = "core-sse-event-unbounded"
+suite = "core"
+description = "SSE decoder buffers events of unbounded size"
+file = "src/high_throughput_vllm_deployment/core/sse.py"
+old = 'if self._size > self._max_event_bytes:'
+new = 'if self._size < 0:'
+tests = ["tests/core/test_core_sse.py"]
+expect = "test_oversized_events_are_rejected"
+
+[[mutant]]
+id = "core-line-buffer-unbounded"
+suite = "core"
+description = "Line decoder buffers a newline-free stream without limit"
+file = "src/high_throughput_vllm_deployment/core/sse.py"
+old = 'if len(self._pending) > self._max:'
+new = 'if len(self._pending) < 0:'
+tests = ["tests/test_hardening.py::test_client_refuses_to_buffer_an_endless_line"]
+expect = "endless_line"
+
+[[mutant]]
+id = "core-retries-non-idempotent-faults"
+suite = "core"
+description = "Client retries read timeouts and dropped connections (duplicate generations)"
+file = "src/high_throughput_vllm_deployment/core/client.py"
+old = '_RETRYABLE_EXCEPTIONS: Final = (httpx.ConnectError, httpx.ConnectTimeout, httpx.PoolTimeout)'
+new = '_RETRYABLE_EXCEPTIONS: Final = (httpx.TransportError,)'
+tests = ["tests/core/test_core_client.py"]
+expect = "test_transport_faults_map_to_engine_errors"
+
+[[mutant]]
+id = "core-sse-done-ignored"
+suite = "core"
+description = "Client keeps reading past the [DONE] sentinel"
+file = "src/high_throughput_vllm_deployment/core/client.py"
+old = 'if data == SSE_DONE_SENTINEL:'
+new = 'if data == "[NOT-DONE]":'
+tests = ["tests/core/test_core_client.py"]
+expect = "test_stream_yields_chunks_until_done|test_stream_stops_at_done"
+
+[[mutant]]
+id = "core-drop-nulls-drops-falsy"
+suite = "core"
+description = "Null pruning also drops 0, false and empty strings"
+file = "src/high_throughput_vllm_deployment/core/client.py"
+old = 'if item is not None}'
+new = 'if item}'
+tests = ["tests/core/test_core_client.py"]
+expect = "test_drop_nulls_is_recursive_and_keeps_falsy_values"
+
+[[mutant]]
+id = "core-deep-json-crash"
+suite = "core"
+description = "Deeply nested SSE JSON escapes as an uncaught RecursionError"
+file = "src/high_throughput_vllm_deployment/core/client.py"
+old = 'except (json.JSONDecodeError, RecursionError) as exc:'
+new = 'except json.JSONDecodeError as exc:'
+tests = ["tests/test_hardening.py::test_deeply_nested_json_is_a_protocol_error_not_a_crash"]
+expect = "deeply_nested_json"
+
+# =========================================================================== #
+# benchmarks: aggregation math, workloads, observers, Locust                  #
+# =========================================================================== #
+
+[[mutant]]
+id = "benchmarks-percentile-rank-off-by-one"
+suite = "benchmarks"
+description = "Percentile rank uses n instead of n - 1"
+file = "src/high_throughput_vllm_deployment/benchmarks/metrics_collector.py"
+old = 'rank = (len(sorted_values) - 1) * q / 100.0'
+new = 'rank = len(sorted_values) * q / 100.0'
+tests = ["tests/benchmarks/test_bench_metrics_collector.py"]
+expect = "test_known_stream_yields_numpy_linear_percentiles"
+
+[[mutant]]
+id = "benchmarks-percentile-no-interpolation"
+suite = "benchmarks"
+description = "Percentiles snap to the lower rank instead of interpolating"
+file = "src/high_throughput_vllm_deployment/benchmarks/metrics_collector.py"
+old = 'value = lo_value + (hi_value - lo_value) * (rank - low)'
+new = 'value = lo_value'
+tests = ["tests/benchmarks/test_bench_metrics_collector.py"]
+expect = "test_known_stream_yields_numpy_linear_percentiles"
+
+[[mutant]]
+id = "benchmarks-mean-unclamped"
+suite = "benchmarks"
+description = "Mean latency may exceed the maximum through float rounding"
+file = "src/high_throughput_vllm_deployment/benchmarks/metrics_collector.py"
+old = 'mean = min(max(math.fsum(values) / len(values), values[0]), values[-1])'
+new = 'mean = math.fsum(values) / len(values)'
+tests = ["tests/benchmarks/test_bench_metrics_collector.py"]
+expect = "test_mean_never_exceeds_max_under_rounding"
+
+[[mutant]]
+id = "benchmarks-failure-rate-zero-division"
+suite = "benchmarks"
+description = "Failure rate divides by zero for an empty run"
+file = "src/high_throughput_vllm_deployment/schemas/telemetry.py"
+old = 'return self.failed_requests / self.total_requests if self.total_requests else 0.0'
+new = 'return self.failed_requests / self.total_requests'
+tests = ["tests/benchmarks/test_bench_metrics_collector.py"]
+expect = "test_zero_requests_is_zero_safe"
+
+[[mutant]]
+id = "benchmarks-throughput-zero-division"
+suite = "benchmarks"
+description = "Request throughput divides by a zero-length window"
+file = "src/high_throughput_vllm_deployment/schemas/telemetry.py"
+old = 'return self.successful_requests / self.duration_s if self.duration_s else 0.0'
+new = 'return self.successful_requests / self.duration_s'
+tests = ["tests/benchmarks/test_bench_metrics_collector.py"]
+expect = "test_zero_requests_is_zero_safe"
+
+[[mutant]]
+id = "benchmarks-poisson-rate-drift"
+suite = "benchmarks"
+description = "Poisson arrivals drift 10% below the configured rate"
+file = "src/high_throughput_vllm_deployment/benchmarks/workload.py"
+old = 'return (rng.expovariate(rate) for _ in itertools.count())'
+new = 'return (rng.expovariate(rate * 0.9) for _ in itertools.count())'
+tests = ["tests/benchmarks/test_bench_workload.py"]
+expect = "test_poisson_arrivals_have_exponential_gaps"
+
+[[mutant]]
+id = "benchmarks-burst-period-wrong"
+suite = "benchmarks"
+description = "Bursts repeat every 1/rate seconds, inflating the mean rate"
+file = "src/high_throughput_vllm_deployment/benchmarks/workload.py"
+old = 'period = burst_size / rate'
+new = 'period = 1.0 / rate'
+tests = ["tests/benchmarks/test_bench_workload.py"]
+expect = "test_burst_arrivals_cluster|test_inter_arrival_gap_streams"
+
+[[mutant]]
+id = "benchmarks-observer-drops-lines"
+suite = "benchmarks"
+description = "Stream observer drops the first complete line of every read"
+file = "src/high_throughput_vllm_deployment/benchmarks/observer.py"
+old = 'for line in self._lines.feed(data):'
+new = 'for line in self._lines.feed(data)[1:]:'
+tests = ["tests/benchmarks/test_bench_observer.py"]
+expect = "test_raw_stream_timing_and_usage|test_arbitrary_chunk_boundaries"
+
+[[mutant]]
+id = "benchmarks-observer-stale-itl"
+suite = "benchmarks"
+description = "Inter-token gaps are measured from the first token, not the previous one"
+file = "src/high_throughput_vllm_deployment/benchmarks/observer.py"
+old = 'self._last = now'
+new = 'self._last = self._first'
+tests = ["tests/benchmarks/test_bench_observer.py"]
+expect = "test_raw_stream_timing_and_usage"
+
+[[mutant]]
+id = "benchmarks-failed-stream-not-drained"
+suite = "benchmarks"
+description = "Non-200 streamed responses keep their pooled connection pinned"
+file = "src/high_throughput_vllm_deployment/benchmarks/observer.py"
+old = '''
+    if status != 200:
+        if stream:
+            release(response)
+'''
+new = '''
+    if status != 200:
+'''
+tests = ["tests/benchmarks/test_bench_observer.py"]
+expect = "test_failed_streams_are_drained"
+
+[[mutant]]
+id = "benchmarks-error-503-misfiled"
+suite = "benchmarks"
+description = "HTTP 503 is filed as a server error instead of unavailability"
+file = "src/high_throughput_vllm_deployment/benchmarks/metrics_collector.py"
+old = 'if status_code == 0 or status_code in (502, 503, 504):'
+new = 'if status_code == 0 or status_code in (502, 504):'
+tests = ["tests/benchmarks/test_bench_metrics_collector.py"]
+expect = "test_status_categories"
+
+[[mutant]]
+id = "benchmarks-recursion-uncategorised"
+suite = "benchmarks"
+description = "RecursionError (deep JSON) is filed as 'other' instead of 'protocol'"
+file = "src/high_throughput_vllm_deployment/benchmarks/metrics_collector.py"
+old = 'if isinstance(exc, EngineProtocolError | ValueError | RecursionError):'
+new = 'if isinstance(exc, EngineProtocolError | ValueError):'
+tests = ["tests/benchmarks/test_bench_metrics_collector.py"]
+expect = "test_exception_categories"
+
+[[mutant]]
+id = "benchmarks-locust-weighting-corrupted"
+suite = "benchmarks"
+description = "Locust stream:json task mix degrades from 3:1 to 1:1"
+file = "src/high_throughput_vllm_deployment/benchmarks/locustfile.py"
+old = '*[ChatScenario.chat_stream] * 3,'
+new = '*[ChatScenario.chat_stream] * 1,'
+tests = ["tests/benchmarks/test_bench_locust.py::test_user_classes_declare_a_3_to_1_stream_mix"]
+expect = "3_to_1_stream_mix"
+
+[[mutant]]
+id = "benchmarks-locust-ttft-events-dropped"
+suite = "benchmarks"
+description = "Custom TTFT/TPOT events never reach Locust's stats"
+file = "src/high_throughput_vllm_deployment/benchmarks/locustfile.py"
+old = 'self.environment.events.request.fire(**event)'
+new = 'del event'
+tests = ["tests/benchmarks/test_bench_locust.py::test_users_measure_streaming_and_blocking_chats"]
+expect = "test_users_measure_streaming_and_blocking_chats"
+
+[[mutant]]
+id = "benchmarks-virtual-clock-jumps-early"
+suite = "benchmarks"
+description = "Virtual timeline skips time while results are still in flight"
+file = "src/high_throughput_vllm_deployment/benchmarks/runner.py"
+old = 'if self.engine.is_quiescent:'
+new = 'if self.engine.is_idle:'
+tests = ["tests/benchmarks/test_bench_runner.py"]
+expect = "test_overload_shows_up_as_queueing_latency|test_virtual_time_honours"
+
+[[mutant]]
+id = "benchmarks-fault-injection-off-by-one"
+suite = "benchmarks"
+description = "Mock server injects faults on the wrong requests"
+file = "src/high_throughput_vllm_deployment/benchmarks/mock_server.py"
+old = '% self.fault_every == 0'
+new = '% self.fault_every == 1'
+tests = ["tests/benchmarks/test_bench_mock_server.py::test_fault_injection_is_deterministic"]
+expect = "test_fault_injection_is_deterministic"
+
+# =========================================================================== #
+# docker: container and cluster hardening                                     #
+# =========================================================================== #
+
+[[mutant]]
+id = "docker-runtime-runs-as-root"
+suite = "docker"
+description = "Runtime image drops the non-root UID 10001"
+file = "Dockerfile"
+old = 'USER 10001:10001'
+new = 'USER 0:0'
+tests = ["tests/test_docker.py"]
+expect = "test_runtime_is_flattened_non_root"
+
+[[mutant]]
+id = "docker-base-image-unpinned"
+suite = "docker"
+description = "Base image referenced by mutable tag instead of digest"
+file = "Dockerfile"
+old = 'python:3.12-slim-bookworm@sha256:935c3c5b12357a7e10caa9c1e6ca5692344d97cf229832ef584be2cec9fc03df'
+new = 'python:3.12-slim-bookworm'
+tests = ["tests/test_docker.py"]
+expect = "test_base_images_are_pinned_by_digest"
+
+[[mutant]]
+id = "docker-runtime-not-flattened"
+suite = "docker"
+description = "Runtime stage inherits layers that still contain apt/dpkg/pip"
+file = "Dockerfile"
+old = 'FROM scratch AS runtime'
+new = 'FROM runtime-rootfs AS runtime'
+tests = ["tests/test_docker.py"]
+expect = "test_runtime_is_flattened"
+
+[[mutant]]
+id = "docker-package-managers-restored"
+suite = "docker"
+description = "apt is no longer removed from the runtime filesystem"
+file = "Dockerfile"
+old = 'rm -rf /usr/bin/apt /usr/bin/apt-* /usr/bin/dpkg'
+new = 'rm -rf /usr/bin/dpkg'
+tests = ["tests/test_docker.py"]
+expect = "free_of_package_managers"
+
+[[mutant]]
+id = "docker-bytecode-timestamp-mode"
+suite = "docker"
+description = "Bytecode compiled with timestamps (non-reproducible layers)"
+file = "Dockerfile"
+old = '--invalidation-mode=checked-hash'
+new = '--invalidation-mode=timestamp'
+tests = ["tests/test_docker.py"]
+expect = "test_application_ships_as_hash_checked_bytecode_only"
+
+[[mutant]]
+id = "docker-build-context-fail-open"
+suite = "docker"
+description = ".dockerignore no longer ignores everything by default"
+file = ".dockerignore"
+old = '''
+*
+!pyproject.toml
+'''
+new = '''
+!pyproject.toml
+'''
+tests = ["tests/test_docker.py"]
+expect = "test_dockerignore_is_fail_closed|test_build_context_contains_exactly"
+
+[[mutant]]
+id = "docker-server-port-all-interfaces"
+suite = "docker"
+description = "vLLM API published on 0.0.0.0 instead of loopback"
+file = "compose.yaml"
+old = '"127.0.0.1:${VLLM_DEPLOYMENT_PORT:-8000}:8000"'
+new = '"0.0.0.0:${VLLM_DEPLOYMENT_PORT:-8000}:8000"'
+tests = ["tests/test_docker.py"]
+expect = "test_published_ports_bind_to_loopback"
+
+[[mutant]]
+id = "docker-mock-port-all-interfaces"
+suite = "docker"
+description = "Mock server published on 0.0.0.0 instead of loopback"
+file = "compose.yaml"
+old = '"127.0.0.1:${MOCK_PORT:-8001}:8000"'
+new = '"0.0.0.0:${MOCK_PORT:-8001}:8000"'
+tests = ["tests/test_docker.py"]
+expect = "test_published_ports_bind_to_loopback"
+
+[[mutant]]
+id = "docker-compose-runs-as-root"
+suite = "docker"
+description = "App containers run as root in Compose"
+file = "compose.yaml"
+old = 'user: "10001:10001"'
+new = 'user: "0:0"'
+tests = ["tests/test_docker.py"]
+expect = "test_app_services_are_hardened"
+
+[[mutant]]
+id = "docker-capabilities-retained"
+suite = "docker"
+description = "App containers keep the default Linux capabilities"
+file = "compose.yaml"
+old = '''
+  cap_drop:
+    - ALL
+'''
+new = '''
+  cap_drop: []
+'''
+tests = ["tests/test_docker.py"]
+expect = "test_app_services_are_hardened"
+
+[[mutant]]
+id = "docker-gpu-reservation-dropped"
+suite = "docker"
+description = "vLLM service no longer reserves NVIDIA GPUs"
+file = "compose.yaml"
+old = 'capabilities: [gpu]'
+new = 'capabilities: [compute]'
+tests = ["tests/test_docker.py"]
+expect = "test_vllm_server_reserves_gpus"

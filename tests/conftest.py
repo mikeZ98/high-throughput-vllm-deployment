@@ -22,12 +22,17 @@ Two invariants are enforced for every test session:
 
 from __future__ import annotations
 
+import gc
 import ipaddress
 import os
 import socket
+import stat
 import tempfile
+import threading
+from collections.abc import Generator
+from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING, Final
+from typing import TYPE_CHECKING, Any, Final
 
 import pytest
 from hypothesis import settings
@@ -205,3 +210,128 @@ def repo_root() -> Path:
 @pytest.fixture(scope="session")
 def cache_root() -> Path:
     return CACHE_ROOT
+
+
+# --------------------------------------------------------------------------- #
+# Resource ledger: zero leaked threads, sockets, pipes or file descriptors    #
+# --------------------------------------------------------------------------- #
+
+_FD_DIR: Final[str] = "/dev/fd" if os.path.isdir("/dev/fd") else "/proc/self/fd"
+
+
+def _warm_up_process_singletons() -> None:
+    """Create lazily-opened, process-lifetime OS handles before the baseline.
+
+    On macOS the first ``getaddrinfo`` opens a kernel control socket
+    (``com.apple.netsrc``) that libinfo keeps for the life of the process; it
+    is not owned by any test and must not be reported as a leak.
+    """
+    socket.getaddrinfo("127.0.0.1", None, flags=socket.AI_NUMERICHOST)
+
+
+def _open_fds() -> dict[int, str]:
+    fds: dict[int, str] = {}
+    for name in os.listdir(_FD_DIR):
+        if int(name) <= 2:
+            continue  # stdio: pytest's output capture re-points these between phases
+        try:
+            mode = os.fstat(int(name)).st_mode
+        except OSError:  # the directory handle used for the listing itself
+            continue
+        kind = (
+            "socket"
+            if stat.S_ISSOCK(mode)
+            else "pipe"
+            if stat.S_ISFIFO(mode)
+            else "file"
+            if stat.S_ISREG(mode)
+            else "other"
+        )
+        fds[int(name)] = kind
+    return fds
+
+
+@dataclass(frozen=True)
+class ResourceSnapshot:
+    fds: dict[int, str]
+    threads: dict[int, str]
+
+    @classmethod
+    def take(cls) -> ResourceSnapshot:
+        threads = {t.ident: t.name for t in threading.enumerate() if t.ident is not None}
+        return cls(_open_fds(), threads)
+
+    def leaks_since(self, before: ResourceSnapshot) -> list[str]:
+        leaks = [
+            f"fd {fd} ({kind})"
+            for fd, kind in sorted(self.fds.items())
+            if before.fds.get(fd) != kind
+        ]
+        leaks += [
+            f"thread {name!r}"
+            for ident, name in self.threads.items()
+            if ident not in before.threads
+        ]
+        return leaks
+
+
+def leaks_since(before: ResourceSnapshot) -> list[str]:
+    """Leaks relative to *before*; collects garbage once before concluding."""
+    leaks = ResourceSnapshot.take().leaks_since(before)
+    if leaks:
+        gc.collect()  # unreferenced-but-unclosed objects are closed (and warned) here
+        leaks = ResourceSnapshot.take().leaks_since(before)
+    return leaks
+
+
+_warm_up_process_singletons()
+_SESSION_BASELINE = pytest.StashKey[ResourceSnapshot]()
+SESSION_LEAKS = pytest.StashKey[list[str]]()
+
+
+@pytest.hookimpl(trylast=True)
+def pytest_sessionstart(session: pytest.Session) -> None:
+    # After every plugin's pytest_configure: pytest's own long-lived handles
+    # (e.g. faulthandler's dup of stderr) exist before the baseline.
+    session.config.stash[_SESSION_BASELINE] = ResourceSnapshot.take()
+
+
+@pytest.hookimpl(wrapper=True)
+def pytest_runtest_protocol(
+    item: pytest.Item, nextitem: pytest.Item | None
+) -> Generator[None, object, object]:
+    """Report a teardown error for any test that leaves threads or descriptors behind.
+
+    The check runs after the whole protocol, i.e. after pytest has released
+    the test's fixture values (``item.funcargs``), so objects that are merely
+    still referenced by finished fixtures are not mistaken for leaks.
+    """
+    before = ResourceSnapshot.take()
+    result = yield
+    leaks = leaks_since(before)
+    if leaks:
+        report = pytest.TestReport(
+            nodeid=item.nodeid,
+            location=item.location,
+            keywords={},
+            outcome="failed",
+            longrepr=f"resource leak after {item.nodeid}: " + ", ".join(leaks),
+            when="teardown",
+        )
+        item.ihook.pytest_runtest_logreport(report=report)
+    return result
+
+
+@pytest.hookimpl(trylast=True)
+def pytest_sessionfinish(session: pytest.Session, exitstatus: int) -> None:
+    baseline = session.config.stash.get(_SESSION_BASELINE, None)
+    leaks = leaks_since(baseline) if baseline is not None else []
+    if leaks:
+        session.config.stash[SESSION_LEAKS] = leaks
+        session.exitstatus = pytest.ExitCode.TESTS_FAILED
+
+
+def pytest_terminal_summary(terminalreporter: Any, exitstatus: int, config: pytest.Config) -> None:
+    leaks = config.stash.get(SESSION_LEAKS, [])
+    if leaks:
+        terminalreporter.write_line("SESSION RESOURCE LEAK: " + ", ".join(leaks), red=True)

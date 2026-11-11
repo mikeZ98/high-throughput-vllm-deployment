@@ -59,10 +59,45 @@ _REASONS: Final = {
     404: "Not Found",
     405: "Method Not Allowed",
     413: "Payload Too Large",
+    414: "URI Too Long",
+    431: "Request Header Fields Too Large",
     500: "Internal Server Error",
     503: "Service Unavailable",
 }
 _MAX_HEADER_LINES: Final = 100
+_LINGER_BYTES: Final = 1 << 20
+_LINGER_SECONDS: Final = 1.0
+
+
+async def _readline(reader: asyncio.StreamReader, status: int) -> bytes:
+    """``readline`` that maps asyncio's line-length limit (64 KiB) to an HTTP error.
+
+    Without this an oversized request/header line raises ``ValueError`` out of
+    the connection task instead of producing a response.
+    """
+    try:
+        return await reader.readline()
+    except ValueError:  # LimitOverrunError surfaces as ValueError from readline()
+        raise _HttpError(status, "request line or header field too large") from None
+
+
+async def _linger(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+    """Lingering close after rejecting a request we did not read in full.
+
+    Closing a socket with unread input makes the kernel send RST, which can
+    destroy the error response before the client reads it. Half-close our side
+    and discard (bounded) input first, as production servers do.
+    """
+    if writer.can_write_eof():
+        writer.write_eof()
+
+    async def discard() -> None:
+        received = 0
+        while received < _LINGER_BYTES and (chunk := await reader.read(65536)):
+            received += len(chunk)
+
+    with contextlib.suppress(TimeoutError, ConnectionError):
+        await asyncio.wait_for(discard(), _LINGER_SECONDS)
 
 
 class _HttpError(Exception):
@@ -170,14 +205,15 @@ class MockVllmServer:
 
     async def _serve_one(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> bool:
         """Serve one request; returns whether the connection stays open."""
-        request_line = await reader.readline()
-        if not request_line:
-            return False
         try:
+            request_line = await _readline(reader, 414)
+            if not request_line:
+                return False
             method, path, keep_alive, body = await self._read_request(request_line, reader)
             await self._dispatch(method, path, body, writer, keep_alive)
         except _HttpError as exc:
             await self._write_json(writer, exc.status, _error_body(exc.status, str(exc)), False)
+            await _linger(reader, writer)
             return False
         return keep_alive
 
@@ -190,7 +226,7 @@ class MockVllmServer:
         method, target, version = parts
         headers: dict[str, str] = {}
         for _ in range(_MAX_HEADER_LINES):
-            line = (await reader.readline()).decode("latin-1").strip()
+            line = (await _readline(reader, 431)).decode("latin-1").strip()
             if not line:
                 break
             name, sep, value = line.partition(":")

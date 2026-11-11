@@ -72,7 +72,7 @@ docstring-code-format = true
 strict = true
 cache_dir = "./.cache/mypy"
 python_version = "3.12"
-files = ["src", "tests"]
+files = ["src", "tests", "scripts"]
 mypy_path = "src"
 warn_unreachable = true
 enable_error_code = ["ignore-without-code", "redundant-expr", "truthy-bool"]
@@ -95,7 +95,10 @@ warn_required_dynamic_aliases = true
 # --------------------------------------------------------------------------- #
 [tool.pytest.ini_options]
 minversion = "8.2"
-addopts = "--disable-socket --allow-hosts=127.0.0.1,localhost"
+# --capture=sys: in-memory capture. The default fd capture creates its temp
+# files at startup, before conftest can re-anchor `tempfile`, i.e. on the host
+# temp dir instead of ./.cache/tmp.
+addopts = "--disable-socket --allow-hosts=127.0.0.1,localhost --capture=sys"
 cache_dir = "./.cache/pytest"
 testpaths = ["tests"]
 xfail_strict = true

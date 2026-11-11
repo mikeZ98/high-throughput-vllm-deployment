@@ -12,7 +12,6 @@ testable) without Locust, whose import monkey-patches the process.
 
 from __future__ import annotations
 
-import codecs
 import contextlib
 import json
 import time
@@ -29,7 +28,7 @@ from high_throughput_vllm_deployment.benchmarks.metrics_collector import (
 )
 from high_throughput_vllm_deployment.core.client import decode_sse_event, drop_nulls
 from high_throughput_vllm_deployment.core.errors import EngineError, EngineProtocolError
-from high_throughput_vllm_deployment.core.sse import SseDecoder
+from high_throughput_vllm_deployment.core.sse import LineDecoder, SseDecoder
 from high_throughput_vllm_deployment.schemas.inference import (
     SSE_DONE_SENTINEL,
     ChatCompletionResponse,
@@ -51,9 +50,8 @@ class StreamObserver:
         self._clock = clock
         self.start_s = clock() if start_s is None else start_s
         self.prompt_tokens = prompt_tokens
+        self._lines = LineDecoder()
         self._sse = SseDecoder()
-        self._utf8 = codecs.getincrementaldecoder("utf-8")("replace")
-        self._pending = ""
         self._raw = False
         self.done = False
         self._first: float | None = None
@@ -82,9 +80,7 @@ class StreamObserver:
     def feed(self, data: bytes | str) -> None:
         """Consume a slice of the response body exactly as received."""
         self._raw = True
-        text = self._utf8.decode(data) if isinstance(data, bytes) else data
-        *lines, self._pending = (self._pending + text).split("\n")
-        for line in lines:
+        for line in self._lines.feed(data):
             self._feed_line(line)
 
     def _feed_line(self, line: str) -> None:
@@ -101,8 +97,7 @@ class StreamObserver:
     def finish(self, now: float | None = None) -> RequestRecord:
         """Close the stream and return its record; raw streams must have ended with [DONE]."""
         if self._raw:
-            self._feed_line(self._pending + self._utf8.decode(b"", final=True))
-            self._pending = ""
+            self._feed_line(self._lines.flush())
             self._feed_line("")
             if not self.done:
                 raise EngineProtocolError("stream ended before [DONE]")
@@ -172,7 +167,7 @@ def record_from_response(
             input_tokens=usage.prompt_tokens,
             output_tokens=usage.completion_tokens,
         )
-    except (EngineError, ValidationError, ValueError, OSError) as exc:
+    except (EngineError, ValidationError, ValueError, OSError, RecursionError) as exc:
         if stream:
             release(response)
         return RequestRecord.failure(start_s, clock(), categorize_exception(exc), repr(exc))

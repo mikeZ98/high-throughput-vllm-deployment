@@ -159,6 +159,7 @@ def test_status_categories(status: int, category: ErrorCategory) -> None:
         (HTTPConnectionClosed(), ErrorCategory.UNAVAILABLE),
         (EngineProtocolError("garbled"), ErrorCategory.PROTOCOL),
         (ValueError("bad json"), ErrorCategory.PROTOCOL),
+        (RecursionError("absurdly deep JSON"), ErrorCategory.PROTOCOL),
         (RuntimeError("?"), ErrorCategory.OTHER),
     ],
 )
