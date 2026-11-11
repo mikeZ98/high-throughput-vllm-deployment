@@ -1,0 +1,199 @@
+"""OpenAI-compatible inference contracts served by the vLLM API server.
+
+Covers ``/v1/completions`` and ``/v1/chat/completions`` request/response
+bodies and the server-sent-event chunks emitted when ``stream=true``.
+"""
+
+from __future__ import annotations
+
+from collections.abc import Sequence
+from typing import Annotated, Final, Literal, Self
+
+from pydantic import Field, model_validator
+
+from high_throughput_vllm_deployment.schemas._base import (
+    ContractModel,
+    FiniteFloat,
+    NonEmptyStr,
+    NonNegativeInt,
+    PositiveInt,
+)
+from high_throughput_vllm_deployment.schemas.enums import LaxFinishReason
+
+ChatRole = Literal["system", "user", "assistant", "tool"]
+StopSequence = Annotated[str, Field(min_length=1)]
+
+SSE_DATA_PREFIX: Final[str] = "data:"
+SSE_DONE_SENTINEL: Final[str] = "[DONE]"
+SSE_DONE_EVENT: Final[str] = f"{SSE_DATA_PREFIX} {SSE_DONE_SENTINEL}\n\n"
+
+
+def _require_unique_indices(indices: Sequence[int]) -> None:
+    if len(set(indices)) != len(indices):
+        raise ValueError("choice indices must be unique")
+
+
+# --------------------------------------------------------------------------- #
+# Requests                                                                    #
+# --------------------------------------------------------------------------- #
+
+
+class ChatMessage(ContractModel):
+    role: ChatRole
+    content: str
+    name: NonEmptyStr | None = None
+
+
+class SamplingParams(ContractModel):
+    """Sampling parameters shared by completion and chat-completion requests."""
+
+    model: NonEmptyStr
+    temperature: Annotated[FiniteFloat, Field(ge=0.0, le=2.0)] = 1.0
+    top_p: Annotated[FiniteFloat, Field(gt=0.0, le=1.0)] = 1.0
+    max_tokens: PositiveInt | None = None
+    n: Annotated[int, Field(ge=1, le=128)] = 1
+    stream: bool = False
+    # Whitespace-only stop sequences (e.g. "\n\n") are legitimate; only empty ones are not.
+    stop: StopSequence | Annotated[list[StopSequence], Field(min_length=1)] | None = None
+    seed: int | None = None
+
+
+class CompletionRequest(SamplingParams):
+    """Body of ``POST /v1/completions``."""
+
+    prompt: NonEmptyStr | Annotated[list[NonEmptyStr], Field(min_length=1)]
+
+
+class ChatCompletionRequest(SamplingParams):
+    """Body of ``POST /v1/chat/completions``."""
+
+    messages: Annotated[list[ChatMessage], Field(min_length=1)]
+
+
+# --------------------------------------------------------------------------- #
+# Responses                                                                   #
+# --------------------------------------------------------------------------- #
+
+
+class Usage(ContractModel):
+    prompt_tokens: NonNegativeInt
+    completion_tokens: NonNegativeInt
+    total_tokens: NonNegativeInt
+
+    @model_validator(mode="after")
+    def _total_is_sum(self) -> Self:
+        expected = self.prompt_tokens + self.completion_tokens
+        if self.total_tokens != expected:
+            raise ValueError(
+                f"total_tokens ({self.total_tokens}) must equal prompt_tokens + "
+                f"completion_tokens ({expected})"
+            )
+        return self
+
+
+class CompletionChoice(ContractModel):
+    index: NonNegativeInt
+    text: str
+    finish_reason: LaxFinishReason | None = None
+
+
+class ChatCompletionChoice(ContractModel):
+    index: NonNegativeInt
+    message: ChatMessage
+    finish_reason: LaxFinishReason | None = None
+
+    @model_validator(mode="after")
+    def _message_is_from_assistant(self) -> Self:
+        if self.message.role != "assistant":
+            raise ValueError("response message role must be 'assistant'")
+        return self
+
+
+class _ResponseEnvelope(ContractModel):
+    id: NonEmptyStr
+    created: NonNegativeInt
+    model: NonEmptyStr
+    usage: Usage
+
+
+class CompletionResponse(_ResponseEnvelope):
+    """Body returned by ``POST /v1/completions`` (non-streaming)."""
+
+    object: Literal["text_completion"] = "text_completion"
+    choices: Annotated[list[CompletionChoice], Field(min_length=1)]
+
+    @model_validator(mode="after")
+    def _unique_choices(self) -> Self:
+        _require_unique_indices([choice.index for choice in self.choices])
+        return self
+
+
+class ChatCompletionResponse(_ResponseEnvelope):
+    """Body returned by ``POST /v1/chat/completions`` (non-streaming)."""
+
+    object: Literal["chat.completion"] = "chat.completion"
+    choices: Annotated[list[ChatCompletionChoice], Field(min_length=1)]
+
+    @model_validator(mode="after")
+    def _unique_choices(self) -> Self:
+        _require_unique_indices([choice.index for choice in self.choices])
+        return self
+
+
+# --------------------------------------------------------------------------- #
+# Streaming                                                                   #
+# --------------------------------------------------------------------------- #
+
+
+class DeltaMessage(ContractModel):
+    """Incremental message fragment carried by one streamed choice."""
+
+    role: ChatRole | None = None
+    content: str | None = None
+
+
+class StreamChoice(ContractModel):
+    index: NonNegativeInt
+    delta: DeltaMessage
+    finish_reason: LaxFinishReason | None = None
+
+
+class StreamChunk(ContractModel):
+    """One ``chat.completion.chunk`` server-sent event.
+
+    ``choices`` may be empty only on the trailing usage-only chunk emitted when
+    ``stream_options.include_usage`` is enabled.
+    """
+
+    id: NonEmptyStr
+    object: Literal["chat.completion.chunk"] = "chat.completion.chunk"
+    created: NonNegativeInt
+    model: NonEmptyStr
+    choices: list[StreamChoice]
+    usage: Usage | None = None
+
+    @model_validator(mode="after")
+    def _choices_or_usage(self) -> Self:
+        if not self.choices and self.usage is None:
+            raise ValueError("a chunk without choices must carry usage")
+        _require_unique_indices([choice.index for choice in self.choices])
+        return self
+
+    def to_sse(self) -> str:
+        """Encode as a single SSE ``data:`` event (including the blank-line terminator)."""
+        return f"{SSE_DATA_PREFIX} {self.model_dump_json()}\n\n"
+
+    @classmethod
+    def from_sse_line(cls, line: str) -> Self | None:
+        """Decode one SSE ``data:`` line; returns ``None`` for the ``[DONE]`` sentinel.
+
+        Raises ``ValueError`` for lines that are not ``data:`` fields and
+        ``pydantic.ValidationError`` for payloads that violate the contract.
+        """
+        stripped = line.strip()
+        if not stripped.startswith(SSE_DATA_PREFIX):
+            raise ValueError(f"not an SSE data line: {line!r}")
+        payload = stripped[len(SSE_DATA_PREFIX) :].strip()
+        if payload == SSE_DONE_SENTINEL:
+            return None
+        return cls.model_validate_json(payload)

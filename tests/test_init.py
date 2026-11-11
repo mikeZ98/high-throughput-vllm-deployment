@@ -54,7 +54,7 @@ def test_python_requirement_is_pinned_to_312() -> None:
 def test_runtime_dependencies() -> None:
     assert sorted(PYPROJECT["project"]["dependencies"]) == [
         "httpx>=0.27.0",
-        "pydantic-settings>=2.4.0",
+        "pydantic-settings>=2.16.2",
         "pydantic>=2.8.0",
     ]
 
