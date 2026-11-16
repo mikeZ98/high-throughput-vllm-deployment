@@ -31,3 +31,5 @@ reports/
 
 # OS noise.
 .DS_Store
+# pnew — secrets + SSD isolation
+.direnv/
